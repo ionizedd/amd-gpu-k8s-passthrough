@@ -1,0 +1,95 @@
+# Kubernetes pod manifest — AMD GPU passthrough via WSL /dev/dxg
+# Tested: RX 9070 XT, ROCm 6.4, k3s on WSL2, torch 2.9.1+rocm6.4
+# Requirements on the HOST (WSL distro):
+#   - ROCm installed at /opt/rocm
+#   - /dev/dxg exists (Windows 11 + WSL2 GPU feature)
+#   - torch venv at /opt/rocm_venv  (see setup-rocm-wsl.sh)
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gpu-train
+  labels:
+    app: gpu-train
+spec:
+  restartPolicy: Never
+
+  volumes:
+    - name: dev-dxg
+      hostPath:
+        path: /dev/dxg
+        type: CharDevice
+    - name: rocm
+      hostPath:
+        path: /opt/rocm
+        type: Directory
+    - name: wsl-libs
+      hostPath:
+        path: /usr/lib/wsl
+        type: Directory
+    - name: rocm-venv
+      hostPath:
+        path: /opt/rocm_venv
+        type: Directory
+    - name: shm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 4Gi
+
+  containers:
+    - name: trainer
+      image: ubuntu:22.04
+      imagePullPolicy: IfNotPresent
+
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -e
+
+          # 1. expose ROCm + WSL libs to the dynamic linker
+          export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib64:/usr/lib/wsl/lib:$LD_LIBRARY_PATH
+          export ROCM_PATH=/opt/rocm
+
+          # 2. WSL libhsa swap (critical!)
+          # The pip torch wheel ships libhsa built for /dev/kfd (bare-metal).
+          # On WSL we need /opt/rocm's copy that speaks /dev/dxg.
+          VENV_HSA=/opt/rocm_venv/lib/python3.*/site-packages/torch/lib/libhsa-runtime64.so*
+          ROCM_HSA=/opt/rocm/lib/libhsa-runtime64.so
+          for f in $VENV_HSA; do
+            [ -e "$f" ] && ln -sf "$ROCM_HSA" "$f" && echo "Swapped $(basename $f)"
+          done
+
+          # 3. activate venv and run
+          source /opt/rocm_venv/bin/activate
+          python /opt/rocm_venv/gpu-test.py
+
+      volumeMounts:
+        - name: dev-dxg
+          mountPath: /dev/dxg
+        - name: rocm
+          mountPath: /opt/rocm
+          readOnly: true
+        - name: wsl-libs
+          mountPath: /usr/lib/wsl
+          readOnly: true
+        - name: rocm-venv
+          mountPath: /opt/rocm_venv
+        - name: shm
+          mountPath: /dev/shm
+
+      securityContext:
+        privileged: true
+
+      resources:
+        limits:
+          memory: "8Gi"
+          cpu: "4"
+        requests:
+          memory: "2Gi"
+          cpu: "1"
+
+      env:
+        - name: HIP_VISIBLE_DEVICES
+          value: "0"
+        - name: PYTORCH_HIP_ALLOC_CONF
+          value: "max_split_size_mb:512"
